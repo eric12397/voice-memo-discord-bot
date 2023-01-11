@@ -5,7 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -112,6 +114,7 @@ func (b *Bot) CommandCenter(s *discordgo.Session, m *discordgo.MessageCreate) {
 		case "list":
 			b.HandleList(s, c)
 		case "upload":
+			b.HandleUpload(s, m)
 		case "record":
 		default:
 			s.ChannelMessageSend(c.ID, "Unrecognizable command, dummy...")
@@ -130,28 +133,34 @@ func (b *Bot) HandleJoin(s *discordgo.Session, g *discordgo.Guild, c *discordgo.
 		return
 	}
 
-	// Create Guild Session.
-	fmt.Println("Creating new Guild session for: ", g.Name)
-	b.GuildSessions[g.ID] = &GuildSession{
-		ID:        g.ID,
-		GuildName: g.Name,
-		Session:   s,
-	}
-
 	// Look for the message sender in that guild's current voice states.
 	fmt.Println("Attempting to join voice channel in ", g.Name)
 	for _, vs := range g.VoiceStates {
 		if vs.UserID == m.Author.ID {
 
+			// Create Guild Session.
+			fmt.Println("Creating new Guild session for ", g.Name)
+			b.GuildSessions[g.ID] = &GuildSession{
+				ID:        g.ID,
+				GuildName: g.Name,
+				Session:   s,
+			}
+
 			// Then join the channel inside that guild.
 			_, err := s.ChannelVoiceJoin(g.ID, vs.ChannelID, false, true)
-
 			if err != nil {
 				fmt.Println("Error joining voice channel:", err)
 				return
 			}
+
+			// Say hello.
+			s.ChannelMessageSend(c.ID, fmt.Sprintf("Hello %s!", g.Name))
+			return
 		}
 	}
+
+	// User must join a voice channel first before commanding bot to join.
+	s.ChannelMessageSend(c.ID, "You must join a voice channel first.")
 }
 
 func (b *Bot) HandleLeave(s *discordgo.Session, g *discordgo.Guild) {
@@ -184,7 +193,73 @@ func (b *Bot) HandlePlay(s *discordgo.Session, g *discordgo.Guild, c *discordgo.
 }
 
 func (b *Bot) HandleList(s *discordgo.Session, c *discordgo.Channel) {
-	s.ChannelMessageSend(c.ID, "Here are all voice memos: zollo, drob, mteams, spongebad, djack")
+	output := "Here are all voice memos: "
+	for _, v := range b.VoiceMemoManager.Store {
+		output += v.name + ", "
+	}
+
+	output = strings.TrimSuffix(output, ", ")
+	s.ChannelMessageSend(c.ID, output)
+}
+
+func (b *Bot) HandleUpload(s *discordgo.Session, m *discordgo.MessageCreate) {
+	if len(m.Attachments) == 0 {
+		s.ChannelMessageSend(m.ChannelID, "Please attach an audio file.")
+		return
+	}
+
+	url := m.Attachments[0].URL
+	res, err := http.Get(url)
+	if err != nil {
+		return
+	}
+	defer res.Body.Close()
+
+	fileName := m.Attachments[0].Filename
+	original, err := os.Create("voicememo_files/" + fileName)
+	if err != nil {
+		return
+	}
+
+	_, err = io.Copy(original, res.Body)
+	if err != nil {
+		return
+	}
+
+	original.Close()
+
+	// Run ffmpeg command to convert the original file to .dca
+	name := strings.Split(fileName, ".")[0]
+	converted, err := os.Create("voicememo_files/" + name + ".dca")
+	if err != nil {
+		return
+	}
+
+	ffmpeg := exec.Command("ffmpeg", "-i", "voicememo_files/"+fileName, "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1")
+	dca := exec.Command("dca")
+
+	dca.Stdin, _ = ffmpeg.StdoutPipe()
+	dca.Stdout = converted
+	dca.Start()
+	ffmpeg.Run()
+	dca.Wait()
+	converted.Close()
+
+	defer func() {
+		if err := os.Remove(original.Name()); err != nil {
+			fmt.Println(err)
+			return
+		}
+	}()
+
+	newVoiceMemo := &VoiceMemo{
+		name:   name,
+		buffer: make([][]byte, 0),
+	}
+	newVoiceMemo.Load()
+	b.VoiceMemoManager.Store[newVoiceMemo.name] = newVoiceMemo
+
+	s.ChannelMessageSend(m.ChannelID, "Successfully uploaded "+name)
 }
 
 type GuildSession struct {
@@ -227,12 +302,16 @@ type VoiceMemoManager struct {
 func NewVoiceMemoManager() (*VoiceMemoManager, error) {
 	voiceMemoMap := make(map[string]*VoiceMemo)
 
-	// Hardcoded for now. Will eventually query from db to get list of voice memos.
-	arr := [5]string{"zollo", "drob", "mteams", "spongebad", "djack"}
+	// Read file names from disk for now. Will eventually query from db to get list of voice memos.
+	files, err := os.ReadDir("voicememo_files/")
+	if err != nil {
+		fmt.Println(err)
+		return nil, err
+	}
 
-	// using for loop
-	for i := 0; i < len(arr); i++ {
-		vm := &VoiceMemo{arr[i], make([][]byte, 0)}
+	for _, f := range files {
+		name := strings.Split(f.Name(), ".")[0]
+		vm := &VoiceMemo{name, make([][]byte, 0)}
 		voiceMemoMap[vm.name] = vm
 	}
 
@@ -292,8 +371,8 @@ func (vm *VoiceMemo) Load() error {
 		}
 
 		// Read encoded pcm from dca file.
-		InBuf := make([]byte, opuslen)
-		err = binary.Read(file, binary.LittleEndian, &InBuf)
+		IntBuf := make([]byte, opuslen)
+		err = binary.Read(file, binary.LittleEndian, &IntBuf)
 
 		// Should not be any end of file errors.
 		if err != nil {
@@ -302,6 +381,6 @@ func (vm *VoiceMemo) Load() error {
 		}
 
 		// Append encoded pcm data to the buffer.
-		vm.buffer = append(vm.buffer, InBuf)
+		vm.buffer = append(vm.buffer, IntBuf)
 	}
 }
