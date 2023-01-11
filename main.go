@@ -193,13 +193,27 @@ func (b *Bot) HandlePlay(s *discordgo.Session, g *discordgo.Guild, c *discordgo.
 }
 
 func (b *Bot) HandleList(s *discordgo.Session, c *discordgo.Channel) {
-	output := "Here are all voice memos: "
-	for _, v := range b.VoiceMemoManager.Store {
-		output += v.name + ", "
+	// Create list embed.
+	embed := &discordgo.MessageEmbed{
+		Title:  "List of all voice memos",
+		Color:  65535,
+		Fields: []*discordgo.MessageEmbedField{},
 	}
 
-	output = strings.TrimSuffix(output, ", ")
-	s.ChannelMessageSend(c.ID, output)
+	for _, v := range b.VoiceMemoManager.Store {
+		field := discordgo.MessageEmbedField{
+			Name:   "\u200b",
+			Value:  "-" + v.name,
+			Inline: true,
+		}
+		embed.Fields = append(embed.Fields, &field)
+	}
+
+	_, err := s.ChannelMessageSendEmbed(c.ID, embed)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 }
 
 func (b *Bot) HandleUpload(s *discordgo.Session, m *discordgo.MessageCreate) {
