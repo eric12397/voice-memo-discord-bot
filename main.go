@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -138,19 +139,21 @@ func (b *Bot) HandleJoin(s *discordgo.Session, g *discordgo.Guild, c *discordgo.
 	for _, vs := range g.VoiceStates {
 		if vs.UserID == m.Author.ID {
 
-			// Create Guild Session.
-			fmt.Println("Creating new Guild session for ", g.Name)
-			b.GuildSessions[g.ID] = &GuildSession{
-				ID:        g.ID,
-				GuildName: g.Name,
-				Session:   s,
-			}
-
 			// Then join the channel inside that guild.
-			_, err := s.ChannelVoiceJoin(g.ID, vs.ChannelID, false, true)
+			vc, err := s.ChannelVoiceJoin(g.ID, vs.ChannelID, false, true)
 			if err != nil {
 				fmt.Println("Error joining voice channel:", err)
 				return
+			}
+
+			// Create Guild Session.
+			fmt.Println("Creating new Guild session for ", g.Name)
+			b.GuildSessions[g.ID] = &GuildSession{
+				ID:              g.ID,
+				GuildName:       g.Name,
+				VoiceConnection: vc,
+				PlayQueue:       make(chan *VoiceMemo, 10), // will set length of channel to 10 for now
+				IsVoicePlaying:  &atomic.Bool{},
 			}
 
 			// Say hello.
@@ -189,7 +192,8 @@ func (b *Bot) HandlePlay(s *discordgo.Session, g *discordgo.Guild, c *discordgo.
 		return
 	}
 
-	gs.Play(voiceMemo)
+	gs.Enqueue(voiceMemo)
+	gs.PlayFromQueue()
 }
 
 func (b *Bot) HandleList(s *discordgo.Session, c *discordgo.Channel) {
@@ -277,35 +281,59 @@ func (b *Bot) HandleUpload(s *discordgo.Session, m *discordgo.MessageCreate) {
 }
 
 type GuildSession struct {
-	ID        string
-	GuildName string
-	Session   *discordgo.Session
-	//PlayQueue
+	ID              string
+	GuildName       string
+	VoiceConnection *discordgo.VoiceConnection
+	PlayQueue       chan *VoiceMemo
+	IsVoicePlaying  *atomic.Bool
 }
 
-func (gs *GuildSession) Play(voiceMemo *VoiceMemo) {
-	vc := gs.Session.VoiceConnections[gs.ID]
+func (gs *GuildSession) Enqueue(voiceMemo *VoiceMemo) {
+	select {
+	case gs.PlayQueue <- voiceMemo:
 
-	// Sleep for a specified amount of time before playing the sound.
-	time.Sleep(100 * time.Millisecond)
+	default:
+		fmt.Println("Queue is currently full. Try again later. Queue count: ", len(gs.PlayQueue))
+		break
+	}
+}
+
+func (gs *GuildSession) PlayFromQueue() {
+	// Don't play if already playing.
+	if gs.IsVoicePlaying.Load() {
+		fmt.Println("Your voice memo is being added to the queue.")
+		return
+	}
+
+	gs.IsVoicePlaying.Store(true) // write new value atomically
+	vc := gs.VoiceConnection
 
 	// Start speaking.
 	vc.Speaking(true)
 
-	// Send the buffer data.
-	for _, buff := range voiceMemo.buffer {
-		vc.OpusSend <- buff
+	for {
+		select {
+		case dequeued := <-gs.PlayQueue:
+
+			// Send the buffer data.
+			for _, buff := range dequeued.buffer {
+				vc.OpusSend <- buff
+			}
+
+			// Sleep for a specificed amount of time before ending.
+			time.Sleep(100 * time.Millisecond)
+
+		default:
+			// Stop speaking.
+			defer vc.Speaking(false)
+			gs.IsVoicePlaying.Store(false)
+			return
+		}
 	}
-
-	// Stop speaking.
-	vc.Speaking(false)
-
-	// Sleep for a specificed amount of time before ending.
-	time.Sleep(100 * time.Millisecond)
 }
 
 func (gs *GuildSession) Disconnect() {
-	gs.Session.VoiceConnections[gs.ID].Disconnect()
+	gs.VoiceConnection.Disconnect()
 }
 
 type VoiceMemoManager struct {
